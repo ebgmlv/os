@@ -1,36 +1,36 @@
-CC      := g++
-CFLAGS  := -Wall -Wextra -pedantic -fPIC -shared
-LDFLAGS := -ldl
+CXX      := g++
+CXXFLAGS := -Wall -Wextra -std=c++17 -pthread
+LDFLAGS  := -ldl -pthread
 
-TARGET  := libcaesar.so
-TEST_BIN:= test_runner
+TARGET     := secure_copy
+LIB_TARGET := libcaesar.so
 
-.PHONY: all install test clean
+.PHONY: all test clean
 
-all: $(TARGET) $(TEST_BIN)
+all: $(LIB_TARGET) $(TARGET)
 
-$(TARGET): libcaesar.cpp
-	$(CC) $(CFLAGS) -o $@ $<
+$(LIB_TARGET): libcaesar.cpp
+	$(CXX) -shared -fPIC -o $@ $<
 
-$(TEST_BIN): test.cpp
-	$(CC) -o $@ $< $(LDFLAGS)
+$(TARGET): secure_copy.cpp
+	$(CXX) $(CXXFLAGS) -o $@ $< $(LDFLAGS)
 
-install: $(TARGET)
-	sudo cp $< /usr/local/lib/
-	sudo ldconfig
-
-test: $(TARGET) $(TEST_BIN)
-	@# Создаем тестовый файл, если его нет (для удобства, т.к. в оригинале его не было)
-	@if [ ! -f input.bin ]; then echo "Creating dummy input.bin"; echo "Hello World" > input.bin; fi
-	./$(TEST_BIN) ./$(TARGET) 1 input.bin output.bin
-	./$(TEST_BIN) ./$(TARGET) 1 output.bin restored.bin
-	@echo "=== input.bin ==="
-	@cat input.bin
-	@echo -e "\n=== output.bin (зашифровано) ==="
-	@cat output.bin
-	@echo -e "\n=== restored.bin ==="
-	@cat restored.bin
-	@echo "✅ Тест пройден: restored.bin идентичен input.bin"
+test: $(TARGET) $(LIB_TARGET)
+	@echo "=== Тест: 3 файла (3 потока) ==="
+	@rm -f log.txt
+	@echo "AAA" > f1.txt && echo "BBB" > f2.txt && echo "CCC" > f3.txt
+	@mkdir -p out_test
+	./$(TARGET) f1.txt f2.txt f3.txt out_test 123
+	@echo -e "\n=== Содержимое log.txt ==="
+	@cat log.txt
+	
+	@echo -e "\n=== Тест: 5 файлов (очередь) ==="
+	@rm -f log.txt
+	@echo "1" > f4.txt && echo "2" > f5.txt
+	./$(TARGET) f1.txt f2.txt f3.txt f4.txt f5.txt out_test 77
+	@echo -e "\n=== Содержимое log.txt ==="
+	@cat log.txt
 
 clean:
-	rm -f $(TARGET) $(TEST_BIN) output.bin restored.bin input.bin
+	rm -f $(TARGET) $(LIB_TARGET) *.txt *.bin 
+	rm -rf out_*
