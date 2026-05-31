@@ -16,6 +16,7 @@
 #include <sstream>
 #include <algorithm>
 #include <filesystem>
+#include <fcntl.h> // [НОВОЕ] Для функций open, O_WRONLY, O_CREAT и pwrite
 
 namespace fs = std::filesystem;
 
@@ -33,6 +34,7 @@ typedef void (*rc4_free_fn)(void*);
 struct FileJob {
     std::string input_path;
     std::string relative_name;
+    size_t offset; // [НОВОЕ] Точная координата в байтах для записи в файл-образ
 };
 
 struct JobQueue {
@@ -53,7 +55,7 @@ struct ThreadData {
     int thread_id;
     std::string master_key;
     std::string image_path;
-    pthread_mutex_t* image_mutex;
+    // [ИЗМЕНЕНО] Мьютекс image_mutex удален, так как запись теперь параллельная
     rc4_init_fn init_fn;
     rc4_crypt_fn crypt_fn;
     rc4_free_fn free_fn;
@@ -142,16 +144,27 @@ void* worker_thread(void* arg) {
         
         uint32_t namelen = job.relative_name.size();
         
-        // Эксклюзивная запись в файл-образ
-        pthread_mutex_lock(td->image_mutex);
-        std::ofstream out(td->image_path, std::ios::binary | std::ios::app);
-        out.write(reinterpret_cast<const char*>(&filesize), 4);
-        out.write(reinterpret_cast<const char*>(&namelen), 4);
-        out.write(reinterpret_cast<const char*>(salt), 16);
-        out.write(job.relative_name.c_str(), namelen);
-        if (filesize > 0) out.write(reinterpret_cast<const char*>(data.data()), filesize);
-        out.close();
-        pthread_mutex_unlock(td->image_mutex);
+        // --- [ИЗМЕНЕНО] ПАРАЛЛЕЛЬНАЯ ЗАПИСЬ ЧЕРЕЗ pwrite ---
+        // Собираем заголовок и зашифрованные данные в единый буфер в оперативной памяти
+        size_t total_record_size = 4 + 4 + 16 + namelen + filesize;
+        std::vector<uint8_t> out_buffer(total_record_size);
+        
+        size_t buf_pos = 0;
+        std::memcpy(out_buffer.data() + buf_pos, &filesize, 4); buf_pos += 4;
+        std::memcpy(out_buffer.data() + buf_pos, &namelen, 4); buf_pos += 4;
+        std::memcpy(out_buffer.data() + buf_pos, salt, 16); buf_pos += 16;
+        std::memcpy(out_buffer.data() + buf_pos, job.relative_name.c_str(), namelen); buf_pos += namelen;
+        if (filesize > 0) {
+            std::memcpy(out_buffer.data() + buf_pos, data.data(), filesize);
+        }
+
+        // Открываем файл и пишем свой кусок строго по координате (job.offset) без мьютекса
+        int fd = open(td->image_path.c_str(), O_WRONLY);
+        if (fd != -1) {
+            pwrite(fd, out_buffer.data(), out_buffer.size(), job.offset);
+            close(fd);
+        }
+        // ---------------------------------------------------
         
         std::cout << "Added: " << job.relative_name << std::endl;
         write_log(td->logger, td->thread_id, job.input_path, "SUCCESS");
@@ -265,7 +278,6 @@ int main(int argc, char* argv[]) {
         return 1;
     }
 
-    // Сохранено старое название библиотеки для минимального diff'a
     void* handle = dlopen("./libcaesar.so", RTLD_NOW);
     if (!handle) { std::cerr << "Library error: " << dlerror() << std::endl; return 1; }
     
@@ -288,18 +300,34 @@ int main(int argc, char* argv[]) {
     if (args.mode == Mode::ADD) {
         JobQueue queue;
         Logger logger{"log.txt"};
-        pthread_mutex_t image_mutex = PTHREAD_MUTEX_INITIALIZER;
+        
+        // [НОВОЕ] Переменная для подсчета текущего смещения в файле
+        size_t current_offset = 0; 
         
         for (const auto& target : args.add_targets) {
             if (fs::is_directory(target)) {
                 for (const auto& entry : fs::recursive_directory_iterator(target)) {
                     if (fs::is_regular_file(entry)) {
                         std::string rel_path = "/" + fs::relative(entry.path(), target).string();
-                        queue.jobs.push({entry.path().string(), rel_path});
+                        
+                        // Заранее узнаем размер файла
+                        uint32_t filesize = fs::file_size(entry.path());
+                        uint32_t namelen = rel_path.size();
+                        
+                        // Передаем текущее смещение в задачу
+                        queue.jobs.push({entry.path().string(), rel_path, current_offset});
+                        
+                        // Сдвигаем координату для следующего файла
+                        current_offset += (4 + 4 + 16 + namelen + filesize);
                     }
                 }
             } else if (fs::is_regular_file(target)) {
-                queue.jobs.push({target, "/" + fs::path(target).filename().string()});
+                std::string rel_path = "/" + fs::path(target).filename().string();
+                uint32_t filesize = fs::file_size(target);
+                uint32_t namelen = rel_path.size();
+                
+                queue.jobs.push({target, rel_path, current_offset});
+                current_offset += (4 + 4 + 16 + namelen + filesize);
             } else {
                 std::cerr << "Warning: Cannot access " << target << "\n";
             }
@@ -307,11 +335,19 @@ int main(int argc, char* argv[]) {
         
         queue.done = true;
         
+        // [НОВОЕ] Создаем пустой образ нужного размера ДО запуска потоков
+        int fd = open(args.image_path.c_str(), O_CREAT | O_WRONLY | O_TRUNC, 0666);
+        if (fd != -1) {
+            ftruncate(fd, current_offset); // Мгновенно растягиваем файл
+            close(fd);
+        }
+        
         ThreadData td[WORKERS_COUNT];
         pthread_t threads[WORKERS_COUNT];
         
         for (int i = 0; i < WORKERS_COUNT; ++i) {
-            td[i] = {&queue, &logger, i, args.key, args.image_path, &image_mutex, rc4_init, rc4_crypt, rc4_free};
+            // Убрали image_mutex из инициализации
+            td[i] = {&queue, &logger, i, args.key, args.image_path, rc4_init, rc4_crypt, rc4_free};
             if (pthread_create(&threads[i], nullptr, worker_thread, &td[i]) != 0) {
                 std::cerr << "Failed to create thread " << i << std::endl;
                 keep_running = 0;
@@ -319,7 +355,7 @@ int main(int argc, char* argv[]) {
         }
         
         for (int i = 0; i < WORKERS_COUNT; ++i) pthread_join(threads[i], nullptr);
-        pthread_mutex_destroy(&image_mutex);
+        
         pthread_mutex_destroy(&queue.mutex);
         pthread_cond_destroy(&queue.cond);
         pthread_mutex_destroy(&logger.mutex);
